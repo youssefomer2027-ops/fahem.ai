@@ -19,6 +19,8 @@ export interface BookContext {
   fileName: string;
   fileSize?: string;
   fileContent?: string;
+  fileBase64?: string;
+  fileMimeType?: string;
   pageCount?: number;
   uploadedAt: string;
 }

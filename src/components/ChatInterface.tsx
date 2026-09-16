@@ -121,10 +121,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         return;
       }
 
+      const isPdf = file.type === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
       const newBookContext: BookContext = {
         fileName,
         fileSize: fileSizeFormatted,
         fileContent: extractData.text,
+        fileBase64: isPdf ? fileBase64 : undefined,
+        fileMimeType: isPdf ? 'application/pdf' : undefined,
         pageCount: extractData.pageCount,
         uploadedAt: new Date().toISOString(),
       };
@@ -247,6 +250,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         body: JSON.stringify({
           fileName: currentBook.fileName,
           fileContent: currentBook.fileContent,
+          fileBase64: currentBook.fileBase64,
+          fileMimeType: currentBook.fileMimeType,
           role: user.role,
           action,
         }),

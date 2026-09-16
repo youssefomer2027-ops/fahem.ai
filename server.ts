@@ -3,7 +3,6 @@ import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
 
 dotenv.config();
@@ -36,6 +35,40 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', hasGeminiKey: Boolean(process.env.GEMINI_API_KEY) });
 });
 
+// Extract text from a PDF using Gemini's native document understanding.
+// Falls back to returning null so the caller can decide how to handle the failure.
+async function extractPdfTextViaGemini(
+  ai: GoogleGenAI,
+  fileBase64: string
+): Promise<{ text: string; pageCount?: number } | null> {
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'application/pdf',
+                data: fileBase64,
+              },
+            },
+            {
+              text: 'استخرج كل النص العربي من هذا الملف PDF بالكامل دون اختصار أو تعديل. أرجع النص فقط بدون أي مقدمة أو تعليق. إذا كان الملف ممسوحاً ضوئياً ولا يحتوي على نص قابل للتحديد، أرجع كلمة: NO_TEXT_FOUND',
+            },
+          ],
+        },
+      ],
+    });
+    const text = (response.text || '').trim();
+    if (!text || text === 'NO_TEXT_FOUND') return null;
+    return { text };
+  } catch {
+    return null;
+  }
+}
+
 // File Upload & Text Extraction Endpoint
 // Client sends raw file bytes as base64 with metadata; server extracts text
 app.post('/api/extract-text', async (req, res) => {
@@ -51,11 +84,28 @@ app.post('/api/extract-text', async (req, res) => {
     let pageCount: number | undefined;
 
     const ext = (fileName || '').toLowerCase().split('.').pop() || '';
+    const isPdf = ext === 'pdf' || mimeType === 'application/pdf';
 
-    if (ext === 'pdf' || mimeType === 'application/pdf') {
-      const pdfData = await pdfParse(buffer);
-      extractedText = pdfData.text;
-      pageCount = pdfData.numpages;
+    if (isPdf) {
+      // Try Gemini native PDF extraction first, then fall back to pdf-parse
+      const ai = getGeminiClient();
+      if (ai) {
+        const geminiResult = await extractPdfTextViaGemini(ai, fileBase64);
+        if (geminiResult && geminiResult.text.length >= 10) {
+          extractedText = geminiResult.text;
+        }
+      }
+      // If Gemini extraction failed, try pdf-parse as fallback
+      if (!extractedText) {
+        try {
+          const { default: pdfParse } = await import('pdf-parse');
+          const pdfData = await pdfParse(buffer);
+          extractedText = pdfData.text;
+          pageCount = pdfData.numpages;
+        } catch (parseErr) {
+          console.error('pdf-parse fallback also failed:', parseErr);
+        }
+      }
     } else if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
       const result = await mammoth.extractRawText({ arrayBuffer: buffer });
       extractedText = result.value;
@@ -96,7 +146,7 @@ app.post('/api/extract-text', async (req, res) => {
 // Book Analysis Endpoint — Explain, Summary, or Quiz
 app.post('/api/analyze-book', async (req, res) => {
   try {
-    const { fileName, fileContent, role, action } = req.body;
+    const { fileName, fileContent, fileBase64, fileMimeType, role, action } = req.body;
     const ai = getGeminiClient();
 
     if (!ai) {
@@ -122,19 +172,40 @@ app.post('/api/analyze-book', async (req, res) => {
 - استخدم تنسيق Markdown العربي السليم (عناوين، قوائم، خط عريض، اقتباسات).
 - لا تُرجع أبداً ردوداً تأكيدية نمطية مثل "تم حفظ طلبك" أو "تم إعداد الاستجابة" أو "تم إنشاء المحتوى بنجاح". أجب مباشرة بالمحتوى التعليمي المفصل.`;
 
+    // Build the content parts — include the PDF as inlineData when available
+    const contentParts: any[] = [];
+
     let prompt = `اسم الملف: ${fileName || 'كتاب تعليمي'}\n\n`;
-    prompt += `=== محتوى الكتاب الكامل ===\n`;
-    prompt += fileContent ? fileContent.slice(0, 50000) : '(لا يوجد محتوى مرفق)';
-    prompt += `\n=== نهاية محتوى الكتاب ===\n\n`;
+
+    // If we have the raw PDF as base64, send it as inlineData so Gemini reads it natively
+    if (fileBase64 && fileMimeType === 'application/pdf') {
+      contentParts.push({
+        inlineData: {
+          mimeType: 'application/pdf',
+          data: fileBase64,
+        },
+      });
+      prompt += `=== محتوى الكتاب (مرفق كملف PDF أعلاه) ===\n`;
+      if (fileContent) {
+        prompt += `نص مستخرج مسبقاً (للمساعدة، قد يكون غير مكتمل):\n${fileContent.slice(0, 30000)}\n`;
+      }
+      prompt += `=== نهاية محتوى الكتاب ===\n\n`;
+    } else {
+      prompt += `=== محتوى الكتاب الكامل ===\n`;
+      prompt += fileContent ? fileContent.slice(0, 50000) : '(لا يوجد محتوى مرفق)';
+      prompt += `\n=== نهاية محتوى الكتاب ===\n\n`;
+    }
+
+    contentParts.push({ text: prompt });
 
     if (action === 'quiz') {
-      prompt += `المطلوب: توليد اختبار تفاعلي من 5 إلى 10 أسئلة اختيار من متعدد بناءً على محتوى الكتاب أعلاه حصراً.
+      const quizPrompt = prompt + `المطلوب: توليد اختبار تفاعلي من 5 إلى 10 أسئلة اختيار من متعدد بناءً على محتوى الكتاب أعلاه حصراً.
 كل سؤال يجب أن يحتوي على 4 خيارات، ورقم الإجابة الصحيحة (0-3)، وشرح تفصيلي لسبب صحة الإجابة ولماذا الخيارات الأخرى خاطئة.
 تنوع مستوى الأسئلة بين الفهم والتطبيق والتحليل.`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: prompt,
+        contents: [{ role: 'user', parts: [...contentParts, { text: quizPrompt }] }],
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
@@ -173,7 +244,7 @@ app.post('/api/analyze-book', async (req, res) => {
         data: parsed,
       });
     } else if (action === 'summary') {
-      prompt += `المطلوب: تقديم تلخيص شامل ومفصل لمحتوى الكتاب أعلاه.
+      const summaryPrompt = prompt + `المطلوب: تقديم تلخيص شامل ومفصل لمحتوى الكتاب أعلاه.
 نظّم التلخيص في أقسام واضحة تغطي:
 1. الفكرة العامة والمحاور الرئيسية للكتاب.
 2. أهم المفاهيم والمصطلحات والتعريفات الواردة (مع شرح موجز لكل منها).
@@ -183,7 +254,7 @@ app.post('/api/analyze-book', async (req, res) => {
 
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: prompt,
+        contents: [{ role: 'user', parts: [...contentParts, { text: summaryPrompt }] }],
         config: { systemInstruction },
       });
 
@@ -194,7 +265,7 @@ app.post('/api/analyze-book', async (req, res) => {
       });
     } else {
       // explain (default)
-      prompt += `المطلوب: تقديم شرح تفصيلي شامل لمحتوى الكتاب أعلاه.
+      const explainPrompt = prompt + `المطلوب: تقديم شرح تفصيلي شامل لمحتوى الكتاب أعلاه.
 نظّم الشرح في أقسام منطقية تغطي:
 1. تمهيد يشرح أهمية موضوع الكتاب وسياقه العام.
 2. شرح كل مفهوم ومصطلح ورد في الكتاب بأسلوب مبسط وواضح، مع أمثلة تطبيقية حيث مناسب.
@@ -204,7 +275,7 @@ app.post('/api/analyze-book', async (req, res) => {
 
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: prompt,
+        contents: [{ role: 'user', parts: [...contentParts, { text: explainPrompt }] }],
         config: { systemInstruction },
       });
 
@@ -259,6 +330,19 @@ ${bookContext?.fileContent ? bookContext.fileContent.slice(0, 50000) : '(لا ي
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }],
     }));
+
+    // If the book is a PDF, prepend the inline data to the first user message
+    if (bookContext?.fileBase64 && bookContext?.fileMimeType === 'application/pdf' && chatHistory.length > 0) {
+      const firstUserIdx = chatHistory.findIndex((m) => m.role === 'user');
+      if (firstUserIdx !== -1) {
+        chatHistory[firstUserIdx].parts.unshift({
+          inlineData: {
+            mimeType: 'application/pdf',
+            data: bookContext.fileBase64,
+          },
+        });
+      }
+    }
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
