@@ -3,13 +3,15 @@ import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
+import pdfParse from 'pdf-parse';
+import mammoth from 'mammoth';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Lazy Gemini client helper
 let aiClient: GoogleGenAI | null = null;
@@ -34,40 +36,104 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', hasGeminiKey: Boolean(process.env.GEMINI_API_KEY) });
 });
 
-// Book Analysis Endpoint
+// File Upload & Text Extraction Endpoint
+// Client sends raw file bytes as base64 with metadata; server extracts text
+app.post('/api/extract-text', async (req, res) => {
+  try {
+    const { fileName, fileBase64, mimeType } = req.body;
+
+    if (!fileBase64) {
+      return res.status(400).json({ success: false, error: 'لم يتم استلام الملف' });
+    }
+
+    const buffer = Buffer.from(fileBase64, 'base64');
+    let extractedText = '';
+    let pageCount: number | undefined;
+
+    const ext = (fileName || '').toLowerCase().split('.').pop() || '';
+
+    if (ext === 'pdf' || mimeType === 'application/pdf') {
+      const pdfData = await pdfParse(buffer);
+      extractedText = pdfData.text;
+      pageCount = pdfData.numpages;
+    } else if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      const result = await mammoth.extractRawText({ arrayBuffer: buffer });
+      extractedText = result.value;
+    } else {
+      // TXT, MD, or unknown — try reading as text
+      extractedText = buffer.toString('utf-8');
+    }
+
+    // Clean up extracted text
+    extractedText = extractedText
+      .replace(/\r\n/g, '\n')
+      .replace(/\n{4,}/g, '\n\n\n')
+      .trim();
+
+    if (!extractedText || extractedText.length < 10) {
+      return res.json({
+        success: false,
+        error: 'لم يتم العثور على نص قابل للقراءة في الملف. تأكد من أن الملف يحتوي على نص قابل للتحديد وليس صوراً ممسوحة ضوئياً.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      fileName,
+      text: extractedText,
+      pageCount,
+      charCount: extractedText.length,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/extract-text:', error);
+    return res.status(500).json({
+      success: false,
+      error: `فشل في قراءة الملف: ${error?.message || 'خطأ غير معروف'}`,
+    });
+  }
+});
+
+// Book Analysis Endpoint — Explain, Summary, or Quiz
 app.post('/api/analyze-book', async (req, res) => {
   try {
     const { fileName, fileContent, role, action } = req.body;
     const ai = getGeminiClient();
 
     if (!ai) {
-      // Return structured high-quality fallback for seamless offline/preview experience
-      return res.json({
-        success: true,
-        source: 'fallback',
-        message: 'تم التحليل بنجاح (وضع العرض التجريبي)',
-        analysis: generateFallbackAnalysis(fileName, fileContent, action, role),
+      return res.status(503).json({
+        success: false,
+        error: 'خدمة الذكاء الاصطناعي غير متاحة حالياً. تأكد من إعداد مفتاح Gemini API.',
       });
     }
 
-    const systemInstruction = `أنت المساعد التعليمي الذكي لمنصة "فَهِم" (Fahem).
-مهمتك مساعدة المستخدمين (طلاب ومعلمون) في فهم المناهج والكتب التعليمية باللغة العربية الفصحى الواضحة والراقية.
-الجمهور المستهدف: ${role === 'teacher' ? 'معلم (أسلوب أكاديمي تربوي)' : 'طالب (أسلوب مبسط وشيق وتفاعلي)'}.
-المطلوب:
-1. تقديم محتوى تعليمي فائق الجودة، منظم ومنسق بتنسيق Markdown عربي سليم.
-2. إذا كان المطلوب شرح: ركز على تبسيط المفاهيم الصعبة وأمثلة تطبيقية.
-3. إذا كان المطلوب تلخيص: ركز على النقاط المحورية والتعريفات والأفكار الأساسية على شكل نقاط واضحة.
-4. إذا كان المطلوب امتحان: وفر 5 إلى 10 أسئلة اختيار من متعدد مع خيارات واضحة، ورقم الإجابة الصحيحة (0 إلى 3)، مع شرح تفصيلي لسبب صحة الإجابة.`;
+    const isTeacher = role === 'teacher';
+    const audience = isTeacher ? 'معلم' : 'طالب';
+    const styleGuide = isTeacher
+      ? 'استخدم أسلوباً أكاديمياً تربوياً موجهاً للمعلم، مع الإشارة إلى نواتج التعلم ومستويات هرم بلوم حيث مناسب.'
+      : 'استخدم أسلوباً مبسطاً شيقاً ومتفاعلاً موجهاً للطالب، مع أمثلة من الحياة اليومية لتقريب المفاهيم.';
 
-    let prompt = `اسم الكتاب/الملف: ${fileName || 'كتاب تعليمي'}\n`;
-    if (fileContent) {
-      prompt += `مقتطف من محتوى الملف: ${fileContent.slice(0, 10000)}\n\n`;
-    }
-    prompt += `الإجراء المطلوب: ${action === 'quiz' ? 'امتحان وأسئلة تدريبية' : action === 'summary' ? 'تلخيص شامل' : 'شرح تفصيلي للمحتوى'}.`;
+    const systemInstruction = `أنت المساعد التعليمي الذكي في منصة "فَهِم" (Fahem).
+مهمتك تحليل الكتب والمناهج التعليمية وتقديم محتوى تعليمي عالي الجودة باللغة العربية الفصحى الواضحة.
+المستخدم الحالي هو ${audience}. ${styleGuide}
+
+قواعد صارمة:
+- اعتمد حصرياً على محتوى الكتاب المرفوع لإنشاء الإجابة. لا تخترع معلومات غير موجودة في النص.
+- إن كان النص غير كافٍ للإجابة الشاملة، اذكر ما هو متاح ووضح أن المرفق لا يحتوي على تفاصيل إضافية.
+- استخدم تنسيق Markdown العربي السليم (عناوين، قوائم، خط عريض، اقتباسات).
+- لا تُرجع أبداً ردوداً تأكيدية نمطية مثل "تم حفظ طلبك" أو "تم إعداد الاستجابة" أو "تم إنشاء المحتوى بنجاح". أجب مباشرة بالمحتوى التعليمي المفصل.`;
+
+    let prompt = `اسم الملف: ${fileName || 'كتاب تعليمي'}\n\n`;
+    prompt += `=== محتوى الكتاب الكامل ===\n`;
+    prompt += fileContent ? fileContent.slice(0, 50000) : '(لا يوجد محتوى مرفق)';
+    prompt += `\n=== نهاية محتوى الكتاب ===\n\n`;
 
     if (action === 'quiz') {
+      prompt += `المطلوب: توليد اختبار تفاعلي من 5 إلى 10 أسئلة اختيار من متعدد بناءً على محتوى الكتاب أعلاه حصراً.
+كل سؤال يجب أن يحتوي على 4 خيارات، ورقم الإجابة الصحيحة (0-3)، وشرح تفصيلي لسبب صحة الإجابة ولماذا الخيارات الأخرى خاطئة.
+تنوع مستوى الأسئلة بين الفهم والتطبيق والتحليل.`;
+
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-2.5-flash',
         contents: prompt,
         config: {
           systemInstruction,
@@ -103,62 +169,91 @@ app.post('/api/analyze-book', async (req, res) => {
       const parsed = JSON.parse(response.text || '{}');
       return res.json({
         success: true,
-        source: 'gemini',
         type: 'quiz',
         data: parsed,
       });
-    } else {
+    } else if (action === 'summary') {
+      prompt += `المطلوب: تقديم تلخيص شامل ومفصل لمحتوى الكتاب أعلاه.
+نظّم التلخيص في أقسام واضحة تغطي:
+1. الفكرة العامة والمحاور الرئيسية للكتاب.
+2. أهم المفاهيم والمصطلحات والتعريفات الواردة (مع شرح موجز لكل منها).
+3. القواعد والقوانين والعلاقات الأساسية (إن وُجدت).
+4. خلاصة استنتاجية تربط بين أجزاء الكتاب.
+استخدم التنسيق Markdown العنواني والقوائم النقطية. كن مفصلاً ودقيقاً ولا تختزل بشكل يفقد المعلومة.`;
+
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-2.5-flash',
         contents: prompt,
-        config: {
-          systemInstruction,
-        },
+        config: { systemInstruction },
       });
 
       return res.json({
         success: true,
-        source: 'gemini',
-        type: action,
+        type: 'summary',
+        content: response.text,
+      });
+    } else {
+      // explain (default)
+      prompt += `المطلوب: تقديم شرح تفصيلي شامل لمحتوى الكتاب أعلاه.
+نظّم الشرح في أقسام منطقية تغطي:
+1. تمهيد يشرح أهمية موضوع الكتاب وسياقه العام.
+2. شرح كل مفهوم ومصطلح ورد في الكتاب بأسلوب مبسط وواضح، مع أمثلة تطبيقية حيث مناسب.
+3. تحليل العلاقات بين المفاهيم وكيفية ارتباطها ببعضها البعض.
+4. نصائح تعليمية لاستيعاب المحتوى وتثبيته في الذاكرة.
+استخدم التنسيق Markdown العنواني والقوائم والاقتباسات. كن مفصلاً وشاملاً ولا تختزل.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: { systemInstruction },
+      });
+
+      return res.json({
+        success: true,
+        type: 'explain',
         content: response.text,
       });
     }
   } catch (error: any) {
     console.error('Error in /api/analyze-book:', error);
-    // Fallback gracefully so the UI never crashes
-    const fallback = generateFallbackAnalysis(
-      req.body.fileName,
-      req.body.fileContent,
-      req.body.action,
-      req.body.role
-    );
-    return res.json({
-      success: true,
-      source: 'fallback',
-      message: 'تم إنشاء الاستجابة عبر النموذج الذكي البديل',
-      analysis: fallback,
-      errorNotice: error?.message,
+    return res.status(500).json({
+      success: false,
+      error: `حدث خطأ أثناء التحليل: ${error?.message || 'خطأ غير معروف'}`,
     });
   }
 });
 
-// Chat Endpoint for Follow-up Inquiries
+// Chat Endpoint for Follow-up Inquiries — sends full book content every time
 app.post('/api/chat', async (req, res) => {
   try {
     const { messages, bookContext, role } = req.body;
     const ai = getGeminiClient();
 
     if (!ai) {
-      const lastMsg = messages[messages.length - 1]?.content || '';
-      return res.json({
-        reply: `أهلاً بك في منصة "فَهِم"! لقد تلقيت استفسارك حول: "${lastMsg}". بخصوص الكتاب المرفوع (${bookContext?.fileName || 'الملف المختار'})، يُرجى التأكد من استيعاب المفاهيم المفتاحية، ويمكنك في أي وقت طلب تلخيص إضافي أو اختبار جديد لاختبار فهمك.`,
+      return res.status(503).json({
+        success: false,
+        error: 'خدمة الذكاء الاصطناعي غير متاحة حالياً.',
       });
     }
 
-    const systemInstruction = `أنت المساعد التعليمي لمنصة "فَهِم" (Fahem).
-تحدث باللغة العربية الفصحى السلسة والمشجعة.
-مهمتك الإجابة عن أي أسئلة يطرحها ${role === 'teacher' ? 'المعلم' : 'الطالب'} حول الكتاب المرفوع حالياً: "${bookContext?.fileName || 'المادة التعليمية'}".
-كن دقيقاً، تعليمياً، واستعن بأمثلة تطبيقية واضحة.`;
+    const isTeacher = role === 'teacher';
+    const audience = isTeacher ? 'معلم' : 'طالب';
+    const styleGuide = isTeacher
+      ? 'استخدم أسلوباً أكاديمياً تربوياً موجهاً للمعلم.'
+      : 'استخدم أسلوباً مبسطاً شيقاً موجهاً للطالب مع أمثلة من الحياة اليومية.';
+
+    const systemInstruction = `أنت المساعد التعليمي الذكي في منصة "فَهِم" (Fahem).
+المستخدم الحالي هو ${audience}. ${styleGuide}
+
+قواعد صارمة:
+- اعتمد حصرياً على محتوى الكتاب المرفوع للإجابة على أسئلة المستخدم. لا تخترع معلومات غير موجودة في النص.
+- إن كان السؤال خارج نطاق محتوى الكتاب، وضح ذلك بأدب ووجّه المستخدم لطرح أسئلة متعلقة بالكتاب.
+- أجب مباشرة وبشكل مفصل وشامل. لا تُرجع ردوداً تأكيدية نمطية مثل "تم حفظ طلبك" أو "تم إعداد الاستجابة".
+- استخدم تنسيق Markdown العربي السليم عند الحاجة (عناوين، قوائم، خط عريض، اقتباسات).
+
+=== محتوى الكتاب المرفوع حالياً: "${bookContext?.fileName || 'لا يوجد كتاب مرفوع'}" ===
+${bookContext?.fileContent ? bookContext.fileContent.slice(0, 50000) : '(لا يوجد محتوى مرفوع بعد)'}
+=== نهاية محتوى الكتاب ===`;
 
     const chatHistory = messages.map((m: { role: string; content: string }) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
@@ -166,155 +261,23 @@ app.post('/api/chat', async (req, res) => {
     }));
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-2.5-flash',
       contents: chatHistory,
-      config: {
-        systemInstruction,
-      },
+      config: { systemInstruction },
     });
 
     return res.json({
+      success: true,
       reply: response.text,
     });
   } catch (err: any) {
     console.error('Error in /api/chat:', err);
-    return res.json({
-      reply: 'عذراً، حدث خطأ مؤقت أثناء معالجة الطلب. يرجى المحاولة مرة أخرى أو اختيار أمر آخر من قائمة الإجراءات.',
+    return res.status(500).json({
+      success: false,
+      error: `حدث خطأ أثناء معالجة المحادثة: ${err?.message || 'خطأ غير معروف'}`,
     });
   }
 });
-
-// Helper for realistic fallback content when offline or API key is pending
-function generateFallbackAnalysis(
-  fileName: string = 'كتاب دراسي',
-  content: string = '',
-  action: 'explain' | 'summary' | 'quiz' = 'explain',
-  role: 'student' | 'teacher' = 'student'
-) {
-  const isTeacher = role === 'teacher';
-  const cleanName = fileName.replace(/\.[^/.]+$/, '');
-
-  if (action === 'summary') {
-    return {
-      type: 'summary',
-      content: `## 📌 التلخيص الشامل لـ "${cleanName}"
-
-${isTeacher ? 'تم إعداد هذا التلخيص كدليل مرجعي تربوي يركز على نواتج التعلم المستهدفة:' : 'أهلاً بك! إليك أهم النقاط الأساسية المستخلصة من الكتاب بأسلوب مبسط ومباشر:'}
-
-### 1. الفكرة الرئيسية والمحاور
-- **المفهوم العام**: يستعرض المحتوى البنية التأسيسية للموضوع مع التركيز على التطبيقات الواقعية والقوانين الحاكمة.
-- **التسلسل المنطقي**: ينتقل المحتوى من التعريفات الأولية إلى التحليل المعمق وحل المشكلات.
-
-### 2. أهم القواعد والمصطلحات
-- **المصطلح الأول**: التعريف الإجرائي وأهميته في السياق التعليمي.
-- **القاعدة الذهبية**: الارتباط المباشر بين السبب والنتيجة وكيفية الاستنتاج الرياضي/المنطقي.
-- **الاستنتاج العملي**: التطبيق في الحياة اليومية والتقنيات المعاصرة.
-
-### 3. خلاصات ختامية
-- التركيز على استيعاب المصطلحات بدلاً من الحفظ المجرد.
-- الربط بين مختلف فصول المنهج لبناء فهم تكاملي.`,
-    };
-  }
-
-  if (action === 'quiz') {
-    return {
-      type: 'quiz',
-      data: {
-        title: `اختبار تدريبي تفاعلي: ${cleanName}`,
-        description: isTeacher
-          ? 'نموذج تقييم تشخيصي وتكويني يقيس مستويات الفهم والتطبيق والتحليل وفق هرم بلوم.'
-          : 'اختبار تدريبي مكون من 5 أسئلة لاختبار مدى استيعابك للمفاهيم الأساسية، مع تصحيح فوري وشرح لكل إجابة.',
-        questions: [
-          {
-            id: 'q1',
-            questionText: `ما هو الهدف الأساسي أو المفهوم المحوري الذي يدور حوله "${cleanName}"؟`,
-            options: [
-              'بناء نموذج معرفي متكامل يربط النظرية بالتطبيق العملي',
-              'سرد معلومات تاريخية غير مترابطة دون تفسير',
-              'حفظ النظريات دون إجراء أي تجارب أو أمثلة',
-              'تجاهل المفاهيم الأساسية والتركيز على الهوامش فقط',
-            ],
-            correctAnswerIndex: 0,
-            explanation:
-              'الإجابة الصحيحة هي الأولى؛ لأن المحتوى التعليمي يهدف دائماً لبناء فهم تكاملي يربط الأساس النظري بحالات الاستخدام والتطبيق الواقعي.',
-          },
-          {
-            id: 'q2',
-            questionText: 'أي من الخطوات التالية تُعد الخطوة الأولى والأساسية لتحليل أي مسألة أو نص علمي؟',
-            options: [
-              'القفز مباشرة إلى النتائج والتخمين',
-              'تحديد المعطيات والمفاهيم المفتاحية بدقة وفصلها عن الاستنتاجات',
-              'تجاهل السياق والاعتماد على الحفظ الآلي فقط',
-              'تطبيق القوانين دون التأكد من شروط انطباقها',
-            ],
-            correctAnswerIndex: 1,
-            explanation:
-              'تحديد المعطيات والمفاهيم المفتاحية هو حجر الأساس في التفكير العلمي والتحليلي السليم قبل الشروع في الحل.',
-          },
-          {
-            id: 'q3',
-            questionText: 'عند حدوث تعارض بين الفرضية والنتيجة التجريبية، ما هو الإجراء المنهجي الصحيح؟',
-            options: [
-              'تعديل النتائج التجريبية لتوافق الفرضية القديمة',
-              'إلغاء التجربة بالكامل واعتبار الموضوع غير قابل للفهم',
-              'إعادة فحص خطوات التجربة وصياغة فرضية جديدة تفسر البيانات بدقة',
-              'تجاهل البيانات الجديدة والاستمرار على الرأي السابق',
-            ],
-            correctAnswerIndex: 2,
-            explanation:
-              'المنهج العلمي يقتضي الأمانة العلمية وفحص المنهجية، ومن ثم تطوير الفرضية لتتسق مع الحقائق التجريبية المرصودة.',
-          },
-          {
-            id: 'q4',
-            questionText: 'كيف يؤثر الربط بين المفاهيم المتباينة في ترسيخ المعرفة على المدى البعيد؟',
-            options: [
-              'يعزز الذاكرة الترابطية ويسهل استدعاء المعلومة وتطبيقها في مواقف جديدة',
-              'يزيد من التشتت ويصعب حل المسائل البسيطة',
-              'لا يترك أي أثر علمي ملحوظ',
-              'يقتصر فائدته على مرحلة الاختبارات الشفوية فقط',
-            ],
-            correctAnswerIndex: 0,
-            explanation:
-              'التعلم ذو المعنى (Meaningful Learning) يقوم على ربط المعارف الجديدة بالبنية المعرفية السابقة مما يدعم الذاكرة طويلة المدى.',
-          },
-          {
-            id: 'q5',
-            questionText: 'ما هي الوسيلة الأنجح للتحقق من إتقان مفهوم دراسي صعب؟',
-            options: [
-              'قراءته لمرة واحدة بسرعة قبل النوم',
-              'شرح المفهوم لشخص آخر بأسلوب مبسط دون الرجوع للكتاب (تقنية فاينمان)',
-              'الاعتماد على حفظ الكلمات الأولى من كل فقرة',
-              'تأجيل دراسته إلى ليلة الاختبار فقط',
-            ],
-            correctAnswerIndex: 1,
-            explanation:
-              'تقنية فاينمان في الشرح والتبسيط تعد المعيار الذهبي لإظهار الفجوات المعرفية والتأكد من الفهم العميق.',
-          },
-        ],
-      },
-    };
-  }
-
-  // Default: explain
-  return {
-    type: 'explain',
-    content: `## 💡 الشرح التوضيحي لـ "${cleanName}"
-
-مرحباً بك! ${isTeacher ? 'دليل الشرح المنهجي لإيصال الفكرة وتدريسها بفاعلية:' : 'إليك الشرح المبسط والمنظم لأبرز ما ورد في الكتاب:'}
-
-### 🌟 المدخل التمهيدي
-يبدأ الكتاب بتمهيد يوضح أهمية هذا العلم في حياتنا وتطبيقاته، موضحاً كيف تتشابك المفاهيم الجزئية لتكون إطاراً عاماً يمكن الاعتماد عليه في الفهم والتحليل.
-
-### 🔍 تحليل العناصر الأساسية
-1. **الأساس النظري**: وضع التعريفات الحاكمة بدقة وتوضيح المصطلحات الفنية باللغة العربية الواضحة.
-2. **العلاقات والتأثيرات**: دراسة كيفية تأثير المتغيرات المختلفة وكيفية قياسها بطرق علمية.
-3. **أمثلة تطبيقية محلولة**: استعراض نماذج قياسية تدرجت من السهولة إلى التحدي لاختبار الفهم الفعلي.
-
-### 🎯 نصيحة تعليمية للتفوق
-> "الفهم الحقيقي يبدأ بالسؤال: **لماذا حدث هذا؟** وليس فقط **ماذا حدث؟**"
-يمكنك الآن طلب **تلخيص** سريع للمحتوى، أو خوض **امتحان تدريبي** لقياس استيعابك فورياً!`,
-  };
-}
 
 // Vite middleware & Static serving
 async function setupServer() {

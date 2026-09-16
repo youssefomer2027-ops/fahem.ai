@@ -5,7 +5,6 @@ import {
   BookOpen,
   Sparkles,
   FileText,
-  FileCheck2,
   GraduationCap,
   BookOpenCheck,
   LogOut,
@@ -70,33 +69,104 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     }
   };
 
-  // Handle uploaded file (PDF / TXT / Doc)
+  // Handle uploaded file (PDF / DOCX / TXT) — send to server for real text extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Reset input so same file can be selected again if needed
     e.target.value = '';
 
     const fileName = file.name;
     const fileSizeFormatted = `${(file.size / (1024 * 1024)).toFixed(2)} ميجابايت`;
 
-    let extractedText = '';
-    try {
-      extractedText = await file.text();
-    } catch {
-      extractedText = `ملف كتاب دراسي: ${fileName} (${fileSizeFormatted})`;
-    }
-
-    const newBookContext: BookContext = {
-      fileName,
-      fileSize: fileSizeFormatted,
-      fileContent: extractedText.slice(0, 15000),
-      uploadedAt: new Date().toISOString(),
+    // Add user upload message immediately
+    const userUploadMsg: ChatMessage = {
+      id: `msg-${Date.now()}-user`,
+      sender: 'user',
+      content: `📎 قمت برفع الكتاب: **${fileName}** (${fileSizeFormatted})`,
+      timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
     };
+    setMessages((prev) => [...prev, userUploadMsg]);
 
-    setCurrentBook(newBookContext);
-    startBookAnalysisWorkflow(newBookContext);
+    setIsAnalyzingFile(true);
+    setAnalysisProgress(10);
+
+    const progressInterval = setInterval(() => {
+      setAnalysisProgress((prev) => {
+        if (prev >= 90) {
+          clearInterval(progressInterval);
+          return 95;
+        }
+        return prev + 20;
+      });
+    }, 400);
+
+    try {
+      // Read file as base64 and send to server for extraction
+      const arrayBuffer = await file.arrayBuffer();
+      const fileBase64 = btoa(
+        new Uint8Array(arrayBuffer).reduce((acc, byte) => acc + String.fromCharCode(byte), '')
+      );
+
+      const extractResponse = await fetch('/api/extract-text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fileName,
+          fileBase64,
+          mimeType: file.type,
+        }),
+      });
+
+      const extractData = await extractResponse.json();
+
+      clearInterval(progressInterval);
+      setIsAnalyzingFile(false);
+      setAnalysisProgress(100);
+
+      if (!extractData.success) {
+        const errorMsg: ChatMessage = {
+          id: `msg-${Date.now()}-error`,
+          sender: 'assistant',
+          content: `### ⚠️ تعذر قراءة الملف\n\n${extractData.error || 'حدث خطأ غير معروف أثناء قراءة الملف.'}\n\nيرجى التأكد من أن الملف يحتوي على نص قابل للتحديد وليس صوراً ممسوحة ضوئياً.`,
+          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+        return;
+      }
+
+      const newBookContext: BookContext = {
+        fileName,
+        fileSize: fileSizeFormatted,
+        fileContent: extractData.text,
+        pageCount: extractData.pageCount,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      setCurrentBook(newBookContext);
+
+      const readyMsg: ChatMessage = {
+        id: `msg-${Date.now()}-ready`,
+        sender: 'assistant',
+        content: `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${fileName}"**\n\nتم استخراج ${extractData.charCount ? extractData.charCount.toLocaleString('ar-EG') : ''} حرف${extractData.pageCount ? ` من ${extractData.pageCount} صفحة` : ''} من النص الكامل وجاهز للتحليل.\n\nما هو احتياجك التعليمي لهذا المنهج الآن؟\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
+        actionType: 'general',
+        timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        bookContext: newBookContext,
+      };
+      setMessages((prev) => [...prev, readyMsg]);
+    } catch (err) {
+      console.error('File upload error:', err);
+      clearInterval(progressInterval);
+      setIsAnalyzingFile(false);
+      setAnalysisProgress(0);
+      const errorMsg: ChatMessage = {
+        id: `msg-${Date.now()}-error`,
+        sender: 'assistant',
+        content: `### ⚠️ تعذر رفع الملف\n\nحدث خطأ أثناء محاولة قراءة الملف. يرجى المحاولة مرة أخرى أو اختيار ملف آخر.`,
+        timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+    }
   };
 
   // Select a pre-loaded sample book
@@ -198,19 +268,30 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
 
       const data = await response.json();
 
+      if (!data.success) {
+        const errorMsg: ChatMessage = {
+          id: `msg-${Date.now()}-error`,
+          sender: 'assistant',
+          content: `### ⚠️ تعذر إكمال العملية\n\n${data.error || 'حدث خطأ غير معروف.'}`,
+          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+        return;
+      }
+
       if (action === 'quiz') {
-        const quizData: QuizData = data.data || data.analysis?.data;
+        const quizData: QuizData = data.data;
         const assistantMsg: ChatMessage = {
           id: `msg-${Date.now()}-quiz`,
           sender: 'assistant',
-          content: `أهلاً بك! تم تجهيز هذا الاختبار التفاعلي بناءً على محتوى **${currentBook.fileName}**. أجب عن الأسئلة ثم اضغط على **تسليم الامتحان** لعرض درجتك وتصحيح كل إجابة مع الشرح:`,
+          content: `أهلاً بك! إليك الاختبار التفاعلي بناءً على محتوى **${currentBook.fileName}**. أجب عن الأسئلة ثم اضغط على **تسليم الامتحان** لعرض درجتك وتصحيح كل إجابة مع الشرح:`,
           actionType: 'quiz',
           quizData,
           timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         };
         setMessages((prev) => [...prev, assistantMsg]);
       } else {
-        const textContent = data.content || data.analysis?.content || '';
+        const textContent = data.content || '';
         const assistantMsg: ChatMessage = {
           id: `msg-${Date.now()}-${action}`,
           sender: 'assistant',
@@ -222,14 +303,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
       }
     } catch (err) {
       console.error('Action error:', err);
-      // Fallback message
-      const fallbackMsg: ChatMessage = {
-        id: `msg-${Date.now()}-fallback`,
+      const errorMsg: ChatMessage = {
+        id: `msg-${Date.now()}-error`,
         sender: 'assistant',
-        content: `تم إعداد الاستجابة لـ **${actionLabel}** بنجاح. يمكنك قراءة الشرح ومواصلة الحوار والاستفسار في أي وقت.`,
+        content: `### ⚠️ حدث خطأ أثناء المعالجة\n\nتعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.`,
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
-      setMessages((prev) => [...prev, fallbackMsg]);
+      setMessages((prev) => [...prev, errorMsg]);
     } finally {
       setIsProcessing(false);
     }
@@ -268,10 +348,22 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
       });
 
       const data = await response.json();
+
+      if (!data.success) {
+        const errorMsg: ChatMessage = {
+          id: `msg-${Date.now()}-error`,
+          sender: 'assistant',
+          content: `### ⚠️ تعذر إكمال المحادثة\n\n${data.error || 'حدث خطأ غير معروف.'}`,
+          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+        return;
+      }
+
       const assistantMsg: ChatMessage = {
         id: `msg-${Date.now()}-assistant`,
         sender: 'assistant',
-        content: data.reply || 'تم استلام سؤالك وتجري معالجته بناءً على مخرجات المنهج.',
+        content: data.reply || '',
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, assistantMsg]);
@@ -280,7 +372,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
       const errorMsg: ChatMessage = {
         id: `msg-${Date.now()}-error`,
         sender: 'assistant',
-        content: `بناءً على محتوى الكتاب المرفوع (${currentBook?.fileName || 'المادة الدراسية'})، تم حفظ استفسارك. هل ترغب في **تلخيص** إضافي أو **اختبار جديد**؟`,
+        content: `### ⚠️ حدث خطأ أثناء المعالجة\n\nتعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.`,
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);
