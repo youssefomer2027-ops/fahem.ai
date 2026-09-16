@@ -35,42 +35,9 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', hasGeminiKey: Boolean(process.env.GEMINI_API_KEY) });
 });
 
-// Extract text from a PDF using Gemini's native document understanding.
-// Falls back to returning null so the caller can decide how to handle the failure.
-async function extractPdfTextViaGemini(
-  ai: GoogleGenAI,
-  fileBase64: string
-): Promise<{ text: string; pageCount?: number } | null> {
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                mimeType: 'application/pdf',
-                data: fileBase64,
-              },
-            },
-            {
-              text: 'استخرج كل النص العربي من هذا الملف PDF بالكامل دون اختصار أو تعديل. أرجع النص فقط بدون أي مقدمة أو تعليق. إذا كان الملف ممسوحاً ضوئياً ولا يحتوي على نص قابل للتحديد، أرجع كلمة: NO_TEXT_FOUND',
-            },
-          ],
-        },
-      ],
-    });
-    const text = (response.text || '').trim();
-    if (!text || text === 'NO_TEXT_FOUND') return null;
-    return { text };
-  } catch {
-    return null;
-  }
-}
-
-// File Upload & Text Extraction Endpoint
-// Client sends raw file bytes as base64 with metadata; server extracts text
+// File Upload & Registration Endpoint
+// For PDFs: accept the file as-is without text validation — Gemini reads it visually during analysis
+// For DOCX/TXT: extract text server-side as before
 app.post('/api/extract-text', async (req, res) => {
   try {
     const { fileName, fileBase64, mimeType } = req.body;
@@ -80,33 +47,24 @@ app.post('/api/extract-text', async (req, res) => {
     }
 
     const buffer = Buffer.from(fileBase64, 'base64');
-    let extractedText = '';
-    let pageCount: number | undefined;
-
     const ext = (fileName || '').toLowerCase().split('.').pop() || '';
     const isPdf = ext === 'pdf' || mimeType === 'application/pdf';
 
     if (isPdf) {
-      // Try Gemini native PDF extraction first, then fall back to pdf-parse
-      const ai = getGeminiClient();
-      if (ai) {
-        const geminiResult = await extractPdfTextViaGemini(ai, fileBase64);
-        if (geminiResult && geminiResult.text.length >= 10) {
-          extractedText = geminiResult.text;
-        }
-      }
-      // If Gemini extraction failed, try pdf-parse as fallback
-      if (!extractedText) {
-        try {
-          const { default: pdfParse } = await import('pdf-parse');
-          const pdfData = await pdfParse(buffer);
-          extractedText = pdfData.text;
-          pageCount = pdfData.numpages;
-        } catch (parseErr) {
-          console.error('pdf-parse fallback also failed:', parseErr);
-        }
-      }
-    } else if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      // Accept PDF as-is — no text extraction or validation.
+      // Gemini will read the PDF visually as inlineData during analysis/chat.
+      return res.json({
+        success: true,
+        fileName,
+        text: '',
+        isPdf: true,
+        charCount: 0,
+      });
+    }
+
+    let extractedText = '';
+
+    if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
       const result = await mammoth.extractRawText({ arrayBuffer: buffer });
       extractedText = result.value;
     } else {
@@ -131,7 +89,6 @@ app.post('/api/extract-text', async (req, res) => {
       success: true,
       fileName,
       text: extractedText,
-      pageCount,
       charCount: extractedText.length,
     });
   } catch (error: any) {

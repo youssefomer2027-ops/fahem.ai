@@ -114,18 +114,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         const errorMsg: ChatMessage = {
           id: `msg-${Date.now()}-error`,
           sender: 'assistant',
-          content: `### ⚠️ تعذر قراءة الملف\n\n${extractData.error || 'حدث خطأ غير معروف أثناء قراءة الملف.'}\n\nيرجى التأكد من أن الملف يحتوي على نص قابل للتحديد وليس صوراً ممسوحة ضوئياً.`,
+          content: `### ⚠️ تعذر قراءة الملف\n\n${extractData.error || 'حدث خطأ غير معروف أثناء قراءة الملف.'}`,
           timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         };
         setMessages((prev) => [...prev, errorMsg]);
         return;
       }
 
-      const isPdf = file.type === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
+      const isPdf = extractData.isPdf || file.type === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
       const newBookContext: BookContext = {
         fileName,
         fileSize: fileSizeFormatted,
-        fileContent: extractData.text,
+        fileContent: extractData.text || '',
         fileBase64: isPdf ? fileBase64 : undefined,
         fileMimeType: isPdf ? 'application/pdf' : undefined,
         pageCount: extractData.pageCount,
@@ -137,7 +137,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
       const readyMsg: ChatMessage = {
         id: `msg-${Date.now()}-ready`,
         sender: 'assistant',
-        content: `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${fileName}"**\n\nتم استخراج ${extractData.charCount ? extractData.charCount.toLocaleString('ar-EG') : ''} حرف${extractData.pageCount ? ` من ${extractData.pageCount} صفحة` : ''} من النص الكامل وجاهز للتحليل.\n\nما هو احتياجك التعليمي لهذا المنهج الآن؟\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
+        content: isPdf
+          ? `### 📚 تم استلام ملف PDF بنجاح: **"${fileName}"**\n\nتم تجهيز الملف للتحليل. سيقوم المساعد الذكي بقراءة محتوى الكتاب بصرياً عند اختيار أي من العمليات التالية:\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`
+          : `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${fileName}"**\n\nتم استخراج ${extractData.charCount ? extractData.charCount.toLocaleString('ar-EG') : ''} حرف${extractData.pageCount ? ` من ${extractData.pageCount} صفحة` : ''} من النص الكامل وجاهز للتحليل.\n\nما هو احتياجك التعليمي لهذا المنهج الآن؟\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
         actionType: 'general',
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         bookContext: newBookContext,
