@@ -1,19 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import {
-  Paperclip,
-  Send,
-  BookOpen,
-  Sparkles,
-  FileText,
-  GraduationCap,
-  BookOpenCheck,
-  LogOut,
-  ChevronRight,
-  RefreshCw,
-  HelpCircle,
-  ListChecks,
-  Compass,
-} from 'lucide-react';
+import { Paperclip, Send, BookOpen, Sparkles, FileText, GraduationCap, BookOpenCheck, LogOut, ChevronRight, RefreshCw, Circle as HelpCircle, ListChecks, Compass } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { FahemLogo } from './FahemLogo';
 import { ExamViewer } from './ExamViewer';
