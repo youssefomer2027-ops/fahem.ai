@@ -19,7 +19,7 @@ function getClient(): GoogleGenAI {
   return client;
 }
 
-const MODEL = 'gemini-2.5-flash';
+const MODEL = 'gemini-3.6-flash';
 
 function buildSystemInstruction(role: 'student' | 'teacher' | undefined): string {
   const isTeacher = role === 'teacher';
