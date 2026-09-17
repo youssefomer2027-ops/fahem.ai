@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Paperclip, Send, BookOpen, Sparkles, FileText, GraduationCap, BookOpenCheck, LogOut, ChevronRight, RefreshCw, Circle as HelpCircle, ListChecks, Compass } from 'lucide-react';
+import { Paperclip, Send, BookOpen, Sparkles, FileText, GraduationCap, BookOpenCheck, LogOut, ChevronRight, ListChecks, Compass, CircleAlert as AlertCircle } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { FahemLogo } from './FahemLogo';
 import { ExamViewer } from './ExamViewer';
@@ -7,6 +7,7 @@ import { FaqSection } from './FaqSection';
 import { FeedbackSection } from './FeedbackSection';
 import { SAMPLE_BOOKS, SampleBook } from '../data/sampleBooks';
 import { UserProfile, BookContext, ChatMessage, QuizData } from '../types';
+import { analyzeBook, chatWithBook, isGeminiConfigured } from '../services/gemini';
 
 interface ChatInterfaceProps {
   user: UserProfile;
@@ -18,13 +19,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputQuery, setInputQuery] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [isAnalyzingFile, setIsAnalyzingFile] = useState<boolean>(false);
-  const [analysisProgress, setAnalysisProgress] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [geminiReady] = useState<boolean>(isGeminiConfigured());
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Initialize welcoming chat message
   useEffect(() => {
     const welcomeMsg: ChatMessage = {
       id: 'welcome-1',
@@ -43,19 +43,16 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     setMessages([welcomeMsg]);
   }, [user]);
 
-  // Scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isAnalyzingFile, isProcessing]);
+  }, [messages, isProcessing, isUploading]);
 
-  // Trigger File Input Click
   const handleTriggerUpload = () => {
     if (fileInputRef.current) {
       fileInputRef.current.click();
     }
   };
 
-  // Handle uploaded file (PDF / DOCX / TXT) — send to server for real text extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -64,8 +61,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
 
     const fileName = file.name;
     const fileSizeFormatted = `${(file.size / (1024 * 1024)).toFixed(2)} ميجابايت`;
+    const isPdf = file.type === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
 
-    // Add user upload message immediately
     const userUploadMsg: ChatMessage = {
       id: `msg-${Date.now()}-user`,
       sender: 'user',
@@ -74,93 +71,62 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     };
     setMessages((prev) => [...prev, userUploadMsg]);
 
-    setIsAnalyzingFile(true);
-    setAnalysisProgress(10);
-
-    const progressInterval = setInterval(() => {
-      setAnalysisProgress((prev) => {
-        if (prev >= 90) {
-          clearInterval(progressInterval);
-          return 95;
-        }
-        return prev + 20;
-      });
-    }, 400);
+    setIsUploading(true);
 
     try {
-      // Read file as base64 and send to server for extraction
-      const arrayBuffer = await file.arrayBuffer();
-      const fileBase64 = btoa(
-        new Uint8Array(arrayBuffer).reduce((acc, byte) => acc + String.fromCharCode(byte), '')
-      );
+      let fileContent = '';
+      let fileBase64: string | undefined;
+      let fileMimeType: string | undefined;
 
-      const extractResponse = await fetch('/api/extract-text', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileName,
-          fileBase64,
-          mimeType: file.type,
-        }),
-      });
-
-      const extractData = await extractResponse.json();
-
-      clearInterval(progressInterval);
-      setIsAnalyzingFile(false);
-      setAnalysisProgress(100);
-
-      if (!extractData.success) {
-        const errorMsg: ChatMessage = {
-          id: `msg-${Date.now()}-error`,
-          sender: 'assistant',
-          content: `### ⚠️ تعذر قراءة الملف\n\n${extractData.error || 'حدث خطأ غير معروف أثناء قراءة الملف.'}`,
-          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-        };
-        setMessages((prev) => [...prev, errorMsg]);
-        return;
+      if (isPdf) {
+        const arrayBuffer = await file.arrayBuffer();
+        fileBase64 = btoa(
+          new Uint8Array(arrayBuffer).reduce((acc, byte) => acc + String.fromCharCode(byte), '')
+        );
+        fileMimeType = 'application/pdf';
+      } else {
+        fileContent = await file.text();
+        fileContent = fileContent.replace(/\r\n/g, '\n').replace(/\n{4,}/g, '\n\n\n').trim();
+        if (!fileContent || fileContent.length < 10) {
+          throw new Error('لم يتم العثور على نص قابل للقراءة في الملف. تأكد من أن الملف يحتوي على نص قابل للتحديد وليس صوراً ممسوحة ضوئياً.');
+        }
       }
 
-      const isPdf = extractData.isPdf || file.type === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
       const newBookContext: BookContext = {
         fileName,
         fileSize: fileSizeFormatted,
-        fileContent: extractData.text || '',
-        fileBase64: isPdf ? fileBase64 : undefined,
-        fileMimeType: isPdf ? 'application/pdf' : undefined,
-        pageCount: extractData.pageCount,
+        fileContent,
+        fileBase64,
+        fileMimeType,
         uploadedAt: new Date().toISOString(),
       };
 
       setCurrentBook(newBookContext);
+      setIsUploading(false);
 
       const readyMsg: ChatMessage = {
         id: `msg-${Date.now()}-ready`,
         sender: 'assistant',
         content: isPdf
           ? `### 📚 تم استلام ملف PDF بنجاح: **"${fileName}"**\n\nتم تجهيز الملف للتحليل. سيقوم المساعد الذكي بقراءة محتوى الكتاب بصرياً عند اختيار أي من العمليات التالية:\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`
-          : `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${fileName}"**\n\nتم استخراج ${extractData.charCount ? extractData.charCount.toLocaleString('ar-EG') : ''} حرف${extractData.pageCount ? ` من ${extractData.pageCount} صفحة` : ''} من النص الكامل وجاهز للتحليل.\n\nما هو احتياجك التعليمي لهذا المنهج الآن؟\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
+          : `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${fileName}"**\n\nتم استخراج ${fileContent.length.toLocaleString('ar-EG')} حرف من النص الكامل وجاهز للتحليل.\n\nما هو احتياجك التعليمي لهذا المنهج الآن؟\n\n1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.\n2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.\n3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
         actionType: 'general',
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         bookContext: newBookContext,
       };
       setMessages((prev) => [...prev, readyMsg]);
-    } catch (err) {
-      console.error('File upload error:', err);
-      clearInterval(progressInterval);
-      setIsAnalyzingFile(false);
-      setAnalysisProgress(0);
+    } catch (err: any) {
+      setIsUploading(false);
       const errorMsg: ChatMessage = {
         id: `msg-${Date.now()}-error`,
         sender: 'assistant',
-        content: `### ⚠️ تعذر رفع الملف\n\nحدث خطأ أثناء محاولة قراءة الملف. يرجى المحاولة مرة أخرى أو اختيار ملف آخر.`,
+        content: `### ⚠️ تعذر قراءة الملف\n\n${err?.message || 'حدث خطأ غير معروف أثناء قراءة الملف.'}`,
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);
     }
   };
 
-  // Select a pre-loaded sample book
   const handleSelectSampleBook = (sample: SampleBook) => {
     const newBookContext: BookContext = {
       fileName: sample.title,
@@ -169,44 +135,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
       uploadedAt: new Date().toISOString(),
     };
     setCurrentBook(newBookContext);
-    startBookAnalysisWorkflow(newBookContext);
-  };
 
-  // Simulated & Real Book Analysis Pipeline
-  const startBookAnalysisWorkflow = (book: BookContext) => {
-    setIsAnalyzingFile(true);
-    setAnalysisProgress(15);
-
-    // Add user upload message
     const userUploadMsg: ChatMessage = {
       id: `msg-${Date.now()}-user`,
       sender: 'user',
-      content: `📎 قمت برفع الكتاب: **${book.fileName}** (${book.fileSize || 'ملف دراسي'})`,
+      content: `📎 قمت برفع الكتاب: **${sample.title}** (${newBookContext.fileSize})`,
       timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
     };
 
-    setMessages((prev) => [...prev, userUploadMsg]);
-
-    const progressInterval = setInterval(() => {
-      setAnalysisProgress((prev) => {
-        if (prev >= 90) {
-          clearInterval(progressInterval);
-          return 95;
-        }
-        return prev + 25;
-      });
-    }, 300);
-
-    // Finish analysis and present the 3 actions
-    setTimeout(() => {
-      clearInterval(progressInterval);
-      setIsAnalyzingFile(false);
-      setAnalysisProgress(100);
-
-      const readyMsg: ChatMessage = {
-        id: `msg-${Date.now()}-ready`,
-        sender: 'assistant',
-        content: `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${book.fileName}"**
+    const readyMsg: ChatMessage = {
+      id: `msg-${Date.now()}-ready`,
+      sender: 'assistant',
+      content: `### 📚 تم تحليل محتوى الكتاب بنجاح: **"${sample.title}"**
 
 تم استخراج النصوص وفهرسة الفصول والمصطلحات الأساسية بدقة. 
 ما هو احتياجك التعليمي لهذا المنهج الآن؟
@@ -214,16 +154,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
 1. 💡 **شرح محتوى الكتاب**: تفكيك المفاهيم الصعبة وضرب أمثلة شارحة.
 2. 📑 **تلخيص المحتوى**: أبرز القواعد والتعريفات والأفكار المحورية.
 3. 📝 **امتحان وأسئلة تدريبية**: بنك أسئلة لقياس مستوى الفهم وتصحيح الإجابات مع الشرح.`,
-        actionType: 'general',
-        timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-        bookContext: book,
-      };
+      actionType: 'general',
+      timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+      bookContext: newBookContext,
+    };
 
-      setMessages((prev) => [...prev, readyMsg]);
-    }, 1200);
+    setMessages((prev) => [...prev, userUploadMsg, readyMsg]);
   };
 
-  // Handle User Action (Explain, Summary, Quiz)
   const handleExecuteAction = async (action: 'explain' | 'summary' | 'quiz') => {
     if (!currentBook) return;
     setIsProcessing(true);
@@ -235,7 +173,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         ? 'تلخيص المحتوى'
         : 'امتحان وأسئلة تدريبية على المنهج';
 
-    // Add user selection message
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}-user-action`,
       sender: 'user',
@@ -246,34 +183,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     setMessages((prev) => [...prev, userMsg]);
 
     try {
-      const response = await fetch('/api/analyze-book', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const result = await analyzeBook(
+        {
           fileName: currentBook.fileName,
           fileContent: currentBook.fileContent,
           fileBase64: currentBook.fileBase64,
           fileMimeType: currentBook.fileMimeType,
-          role: user.role,
-          action,
-        }),
-      });
+        },
+        action,
+        user.role,
+      );
 
-      const data = await response.json();
-
-      if (!data.success) {
-        const errorMsg: ChatMessage = {
-          id: `msg-${Date.now()}-error`,
-          sender: 'assistant',
-          content: `### ⚠️ تعذر إكمال العملية\n\n${data.error || 'حدث خطأ غير معروف.'}`,
-          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-        };
-        setMessages((prev) => [...prev, errorMsg]);
-        return;
-      }
-
-      if (action === 'quiz') {
-        const quizData: QuizData = data.data;
+      if (result.type === 'quiz') {
+        const quizData: QuizData = result.data;
         const assistantMsg: ChatMessage = {
           id: `msg-${Date.now()}-quiz`,
           sender: 'assistant',
@@ -284,22 +206,20 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         };
         setMessages((prev) => [...prev, assistantMsg]);
       } else {
-        const textContent = data.content || '';
         const assistantMsg: ChatMessage = {
           id: `msg-${Date.now()}-${action}`,
           sender: 'assistant',
-          content: textContent,
+          content: result.content,
           actionType: action,
           timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
         };
         setMessages((prev) => [...prev, assistantMsg]);
       }
-    } catch (err) {
-      console.error('Action error:', err);
+    } catch (err: any) {
       const errorMsg: ChatMessage = {
         id: `msg-${Date.now()}-error`,
         sender: 'assistant',
-        content: `### ⚠️ حدث خطأ أثناء المعالجة\n\nتعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.`,
+        content: `### ⚠️ تعذر إكمال العملية\n\n${err?.message || 'حدث خطأ غير معروف.'}`,
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -308,7 +228,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     }
   };
 
-  // Handle Free-form User Chat Message
   const handleSendChat = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const query = inputQuery.trim();
@@ -327,45 +246,34 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
     setIsProcessing(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: updatedMessages.map((m) => ({
-            role: m.sender === 'user' ? 'user' : 'assistant',
-            content: m.content,
-          })),
-          bookContext: currentBook,
-          role: user.role,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!data.success) {
-        const errorMsg: ChatMessage = {
-          id: `msg-${Date.now()}-error`,
-          sender: 'assistant',
-          content: `### ⚠️ تعذر إكمال المحادثة\n\n${data.error || 'حدث خطأ غير معروف.'}`,
-          timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-        };
-        setMessages((prev) => [...prev, errorMsg]);
-        return;
-      }
+      const reply = await chatWithBook(
+        updatedMessages.map((m) => ({
+          role: m.sender === 'user' ? 'user' as const : 'assistant' as const,
+          content: m.content,
+        })),
+        currentBook
+          ? {
+              fileName: currentBook.fileName,
+              fileContent: currentBook.fileContent,
+              fileBase64: currentBook.fileBase64,
+              fileMimeType: currentBook.fileMimeType,
+            }
+          : { fileName: '' },
+        user.role,
+      );
 
       const assistantMsg: ChatMessage = {
         id: `msg-${Date.now()}-assistant`,
         sender: 'assistant',
-        content: data.reply || '',
+        content: reply || '',
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, assistantMsg]);
-    } catch (err) {
-      console.error('Chat error:', err);
+    } catch (err: any) {
       const errorMsg: ChatMessage = {
         id: `msg-${Date.now()}-error`,
         sender: 'assistant',
-        content: `### ⚠️ حدث خطأ أثناء المعالجة\n\nتعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.`,
+        content: `### ⚠️ تعذر إكمال المحادثة\n\n${err?.message || 'حدث خطأ غير معروف.'}`,
         timestamp: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -376,7 +284,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
 
   return (
     <div className="min-h-screen w-full bg-[#fafafa] flex flex-col text-neutral-900" id="fahem-chat-app">
-      {/* Hidden File Input for PDF / Text books */}
       <input
         type="file"
         ref={fileInputRef}
@@ -386,13 +293,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         id="book-file-picker"
       />
 
-      {/* Top Header */}
       <header className="sticky top-0 z-30 w-full bg-white/95 backdrop-blur-md border-b border-neutral-200 px-4 md:px-8 py-3.5 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <FahemLogo size="sm" />
         </div>
 
-        {/* User Status Badge & Controls */}
         <div className="flex items-center gap-2.5">
           {currentBook && (
             <div className="hidden sm:flex items-center gap-2 px-3 py-1 bg-neutral-100 border border-neutral-200 rounded-xl text-xs font-bold text-neutral-800">
@@ -435,9 +340,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
         </div>
       </header>
 
-      {/* Main Content Area */}
+      {!geminiReady && (
+        <div className="mx-4 mt-4 max-w-4xl w-full self-center bg-amber-50 border border-amber-300 rounded-2xl p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div>
+            <h4 className="text-sm font-bold text-amber-800">مفتاح Gemini API غير مهيأ</h4>
+            <p className="text-xs text-amber-700 mt-1 leading-relaxed">
+              لكي يعمل التحليل والمحادثة، يجب إضافة مفتاح Gemini API في ملف .env باسم <code className="bg-amber-100 px-1 rounded">VITE_GEMINI_API_KEY</code>. أعد تشغيل الخادم بعد إضافته.
+            </p>
+          </div>
+        </div>
+      )}
+
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 py-6 flex flex-col gap-6">
-        {/* Sample Books Quick Selector (if no book chosen yet or for fast switching) */}
         {!currentBook && (
           <div className="bg-white border border-neutral-200 rounded-2xl p-5 shadow-xs" id="sample-books-selector">
             <div className="flex items-center gap-2 mb-3">
@@ -476,7 +391,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
           </div>
         )}
 
-        {/* Active Book Action Bar (When a book is active) */}
         {currentBook && (
           <div className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-xs flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -491,12 +405,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
               </div>
             </div>
 
-            {/* Quick 3-Choice Buttons */}
             <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
                 id="btn-quick-explain"
-                disabled={isProcessing || isAnalyzingFile}
+                disabled={isProcessing || isUploading}
                 onClick={() => handleExecuteAction('explain')}
                 className="px-3 py-1.5 bg-neutral-100 hover:bg-black hover:text-white text-xs font-bold text-neutral-800 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
               >
@@ -507,7 +420,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
               <button
                 type="button"
                 id="btn-quick-summary"
-                disabled={isProcessing || isAnalyzingFile}
+                disabled={isProcessing || isUploading}
                 onClick={() => handleExecuteAction('summary')}
                 className="px-3 py-1.5 bg-neutral-100 hover:bg-black hover:text-white text-xs font-bold text-neutral-800 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
               >
@@ -518,7 +431,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
               <button
                 type="button"
                 id="btn-quick-quiz"
-                disabled={isProcessing || isAnalyzingFile}
+                disabled={isProcessing || isUploading}
                 onClick={() => handleExecuteAction('quiz')}
                 className="px-3 py-1.5 bg-black text-white hover:bg-neutral-800 text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
               >
@@ -529,7 +442,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
           </div>
         )}
 
-        {/* Chat Messages Stream Area */}
         <div className="bg-white border border-neutral-200 rounded-3xl p-4 md:p-6 shadow-xs flex-1 flex flex-col gap-6 min-h-[420px]" id="chat-messages-container">
           {messages.map((msg) => {
             const isUser = msg.sender === 'user';
@@ -539,7 +451,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
                 id={`chat-msg-${msg.id}`}
                 className={`flex gap-3 items-start ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
               >
-                {/* Avatar */}
                 <div
                   className={`w-8 h-8 rounded-xl shrink-0 flex items-center justify-center text-xs font-black select-none ${
                     isUser ? 'bg-neutral-200 text-neutral-800' : 'bg-black text-white'
@@ -548,7 +459,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
                   {isUser ? 'أنت' : 'فَهِم'}
                 </div>
 
-                {/* Message Body */}
                 <div
                   className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed ${
                     isUser
@@ -578,7 +488,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
                     </ReactMarkdown>
                   </div>
 
-                  {/* Interactive Action Buttons inside assistant ready prompt */}
                   {msg.actionType === 'general' && currentBook && (
                     <div className="mt-4 pt-3 border-t border-neutral-200/80 flex flex-wrap gap-2">
                       <button
@@ -613,7 +522,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
                     </div>
                   )}
 
-                  {/* Render Exam if message contains quizData */}
                   {msg.quizData && (
                     <ExamViewer
                       quiz={msg.quizData}
@@ -637,32 +545,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
             );
           })}
 
-          {/* Analyzing book animated state */}
-          {isAnalyzingFile && (
-            <div className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 text-neutral-800 space-y-3" id="book-analysis-progress-card">
+          {isUploading && (
+            <div className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 text-neutral-800" id="file-reading-card">
               <div className="flex items-center gap-3">
-                <RefreshCw className="w-5 h-5 text-black animate-spin" />
-                <div className="flex-1">
-                  <h4 className="text-xs md:text-sm font-black text-black">
-                    جاري استخراج وتحليل محتوى الكتاب ({currentBook?.fileName})...
-                  </h4>
-                  <p className="text-[11px] text-neutral-500 mt-0.5">
-                    تقسيم الفصول واستخراج المفاهيم الأساسية لبناء قاعدة المعرفة والامتحانات
-                  </p>
-                </div>
-                <span className="text-xs font-black text-black">{analysisProgress}%</span>
-              </div>
-              <div className="w-full bg-neutral-200 rounded-full h-1.5 overflow-hidden">
-                <div
-                  className="bg-black h-1.5 rounded-full transition-all duration-300"
-                  style={{ width: `${analysisProgress}%` }}
-                />
+                <div className="w-5 h-5 border-2 border-neutral-300 border-t-black rounded-full animate-spin" />
+                <h4 className="text-xs md:text-sm font-black text-black">
+                  جاري قراءة الملف وتحويله للتحليل...
+                </h4>
               </div>
             </div>
           )}
 
-          {/* Ongoing processing indicator */}
-          {isProcessing && !isAnalyzingFile && (
+          {isProcessing && !isUploading && (
             <div className="flex items-center gap-2 text-xs text-neutral-500 py-2 pr-11">
               <div className="w-2 h-2 rounded-full bg-neutral-400 animate-pulse" />
               <div className="w-2 h-2 rounded-full bg-neutral-600 animate-pulse" />
@@ -674,10 +568,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Bottom Chat Input Bar with 📎 Paperclip Button */}
         <div className="sticky bottom-4 z-20 bg-white border border-neutral-200 rounded-2xl p-2.5 shadow-md">
           <form onSubmit={handleSendChat} className="flex items-center gap-2">
-            {/* 📎 File Upload Button */}
             <button
               type="button"
               id="upload-file-btn"
@@ -688,7 +580,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
               <Paperclip className="w-5 h-5 rotate-45" />
             </button>
 
-            {/* Input Query Field */}
             <input
               type="text"
               id="chat-input-query"
@@ -702,7 +593,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
               className="flex-1 bg-transparent text-sm py-2 px-2 text-neutral-900 placeholder:text-neutral-400 focus:outline-none font-medium"
             />
 
-            {/* Send Button */}
             <button
               type="submit"
               id="chat-send-btn"
@@ -717,19 +607,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onLogout }) 
             </button>
           </form>
 
-          {/* Small helper info */}
           <div className="flex items-center justify-between px-2 pt-2 text-[10px] text-neutral-400">
             <span>يدعم ملفات الكتب PDF والمستندات النصية</span>
             <span>منصة فَهِم — بالذكاء الاصطناعي</span>
           </div>
         </div>
 
-        {/* Section under chat: FAQ Accordion & Feedback Form */}
         <div className="mt-4 pt-6 border-t border-neutral-200 space-y-6" id="bottom-fixed-section">
-          {/* FAQ Accordion */}
           <FaqSection />
-
-          {/* Feedback Form */}
           <FeedbackSection />
         </div>
       </main>
